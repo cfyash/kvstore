@@ -57,6 +57,19 @@ func openActiveFile(path string, id int) (*datafile, error) {
 	}, nil
 }
 
+func openMergeFile(path string, id int) (*datafile, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &datafile{
+		id:     id,
+		path:   path,
+		offset: 0,
+		file:   file,
+	}, nil
+}
+
 func ensureDir(path string) error {
 	return os.MkdirAll(path, 0755)
 }
@@ -95,4 +108,12 @@ func (f *datafile) close() {
 
 func removeFile(path string) {
 	os.Remove(path)
+}
+
+func move(from, to *datafile) error {
+	fromPath := from.path
+	toPath := to.path
+	from.close()
+	to.close()
+	return os.Rename(fromPath, toPath)
 }

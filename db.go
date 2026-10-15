@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -67,63 +68,6 @@ func newDB(path string, fileIDs []int) (*DB, error) {
 		path:         path,
 		files:        files,
 	}, nil
-}
-
-func (db *DB) rebuild(fileIDs []int) error {
-	for _, id := range fileIDs {
-		file := db.files[id]
-		var offset int64 = 0
-		for {
-			h, err := file.read(offset, 16)
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				if id == db.activeFileID {
-					break
-				} else {
-					return err
-				}
-			}
-			if err != nil {
-				return err
-			}
-			chksum, timestamp, keySize, valueSize := decodeHeader(h)
-			b, err := file.read(offset+16, keySize+valueSize)
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				if id == db.activeFileID {
-					break
-				} else {
-					return err
-				}
-			}
-			if err != nil {
-				return err
-			}
-			record, err := decodeBody(chksum, timestamp, keySize, valueSize, b)
-			if err != nil {
-				if id == db.activeFileID {
-					break
-				} else {
-					return err
-				}
-			}
-			if record.tombstone {
-				db.memstore.delete(string(record.key))
-			} else {
-				db.memstore.put(string(record.key), id, offset, uint32(16+len(b)), record.timestamp)
-			}
-			offset += int64(16 + len(b))
-		}
-		if id == db.activeFileID {
-			file.offset = offset
-			err := file.file.Truncate(file.offset)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func (db *DB) Write(key string, value []byte) error {
@@ -212,4 +156,137 @@ func (db *DB) rotate() (err error) {
 	db.files[activeFile.id] = roFile
 	activeFile.close()
 	return
+}
+
+func (db *DB) scanFile(file *datafile, op func(rec *record, offset int64, size uint32, id int) error) (int64, error) {
+	offset := int64(0)
+	for {
+		h, err := file.read(offset, 16)
+		if errors.Is(err, io.EOF) {
+			return offset, nil
+		}
+		if err != nil {
+			return offset, err
+		}
+		chksum, timestamp, keySize, valueSize := decodeHeader(h)
+		b, err := file.read(offset+16, keySize+valueSize)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return offset, io.ErrUnexpectedEOF
+			}
+			return offset, err
+		}
+		record, err := decodeBody(chksum, timestamp, keySize, valueSize, b)
+		if err != nil {
+			return offset, err
+		}
+		err = op(record, offset, uint32(16+len(b)), file.id)
+		if err != nil {
+			return offset, err
+		}
+		offset += int64(16 + len(b))
+	}
+}
+
+func (db *DB) merge() error {
+	toBeMerged := make([]int, 0, len(db.files))
+	for fileID, _ := range db.files {
+		if fileID == db.activeFileID {
+			continue
+		}
+		toBeMerged = append(toBeMerged, fileID)
+	}
+	if len(toBeMerged) == 0 {
+		return nil
+	}
+	slices.Sort(toBeMerged)
+	mergeFileId := toBeMerged[0]
+	tempKeyDir := newMergeKeyDir()
+	tempFilePath := filepath.Join(db.path, "tempMerge"+extension)
+	tempFile, err := openMergeFile(tempFilePath, mergeFileId)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		tempFile.close()
+		removeFile(tempFilePath)
+	}()
+	op := func(rec *record, offset int64, size uint32, id int) error {
+		if rec.tombstone {
+			return nil
+		}
+		entry, err := db.memstore.read(string(rec.key))
+		if err != nil && errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		if id == entry.fileID && offset == entry.offset && entry.size == size && entry.timestamp == rec.timestamp {
+			writeOffset, _, err := tempFile.write(rec.encode())
+			if err != nil {
+				return err
+			}
+			tempKeyDir.put(string(rec.key), tempFile.id, writeOffset, size, rec.timestamp, entry)
+		}
+		return nil
+	}
+	for _, id := range toBeMerged {
+		file := db.files[id]
+		_, err := db.scanFile(file, op)
+		if err != nil {
+			return err
+		}
+	}
+	destFile := db.files[mergeFileId]
+	destPath := destFile.path
+	err = move(tempFile, destFile)
+	if err != nil {
+		return err
+	}
+	roTempFile, err := openDataFile(destPath, mergeFileId)
+	if err != nil {
+		return err
+	}
+	db.files[mergeFileId] = roTempFile
+	db.memstore.copyMergeKeyDir(tempKeyDir)
+	for _, id := range toBeMerged {
+		if id == mergeFileId {
+			continue
+		}
+		f := db.files[id]
+		delete(db.files, id)
+		f.close()
+		removeFile(f.path)
+	}
+	return nil
+}
+
+func (db *DB) rebuild(fileIDs []int) error {
+	op := func(rec *record, offset int64, size uint32, id int) error {
+		if rec.tombstone {
+			db.memstore.delete(string(rec.key))
+		} else {
+			db.memstore.put(string(rec.key), id, offset, size, rec.timestamp)
+		}
+		return nil
+	}
+	for _, id := range fileIDs {
+		file := db.files[id]
+		offset, err := db.scanFile(file, op)
+		if err != nil {
+			if !errors.Is(err, ErrCorruptRecord) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				return err
+			}
+
+			if id != db.activeFileID {
+				return err
+			}
+
+			if err := file.file.Truncate(offset); err != nil {
+				return err
+			}
+		}
+		if id == db.activeFileID {
+			file.offset = offset
+		}
+	}
+	return nil
 }
