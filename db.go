@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,8 @@ type DB struct {
 	activeFileID int
 	path         string
 	files        map[int]*datafile
+	mu           sync.RWMutex
+	mergeMu      sync.Mutex
 }
 
 const extension string = ".dat"
@@ -76,6 +79,8 @@ func (db *DB) Write(key string, value []byte) error {
 	}
 	record := newRecord(uint32(time.Now().Unix()), key, value)
 	arr := record.encode()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	activeFile := db.files[db.activeFileID]
 	writeOffset, writtenSize, err := activeFile.write(arr)
 	if err != nil {
@@ -90,6 +95,8 @@ func (db *DB) Write(key string, value []byte) error {
 }
 
 func (db *DB) Read(key string) ([]byte, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	entry, err := db.memstore.read(key)
 	if err != nil {
 		return nil, err
@@ -112,6 +119,8 @@ func (db *DB) Read(key string) ([]byte, error) {
 func (db *DB) Delete(key string) error {
 	record := newRecord(uint32(time.Now().Unix()), key, []byte{})
 	arr := record.encode()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	activeFile := db.files[db.activeFileID]
 	_, _, err := activeFile.write(arr)
 	if err != nil {
@@ -189,6 +198,12 @@ func (db *DB) scanFile(file *datafile, op func(rec *record, offset int64, size u
 }
 
 func (db *DB) merge() error {
+	ok := db.mergeMu.TryLock()
+	if !ok {
+		return ErrParallelMergeRunning
+	}
+	defer db.mergeMu.Unlock()
+	db.mu.RLock()
 	toBeMerged := make([]int, 0, len(db.files))
 	for fileID, _ := range db.files {
 		if fileID == db.activeFileID {
@@ -196,6 +211,7 @@ func (db *DB) merge() error {
 		}
 		toBeMerged = append(toBeMerged, fileID)
 	}
+	db.mu.RUnlock()
 	if len(toBeMerged) == 0 {
 		return nil
 	}
@@ -212,6 +228,8 @@ func (db *DB) merge() error {
 		removeFile(tempFilePath)
 	}()
 	op := func(rec *record, offset int64, size uint32, id int) error {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
 		if rec.tombstone {
 			return nil
 		}
@@ -228,13 +246,20 @@ func (db *DB) merge() error {
 		}
 		return nil
 	}
-	for _, id := range toBeMerged {
-		file := db.files[id]
+	files := make([]*datafile, len(toBeMerged))
+	db.mu.RLock()
+	for i := range len(files) {
+		files[i] = db.files[toBeMerged[i]]
+	}
+	db.mu.RUnlock()
+	for _, file := range files {
 		_, err := db.scanFile(file, op)
 		if err != nil {
 			return err
 		}
 	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	destFile := db.files[mergeFileId]
 	destPath := destFile.path
 	err = move(tempFile, destFile)
