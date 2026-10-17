@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -116,22 +117,26 @@ func (db *DB) Read(key string) ([]byte, error) {
 	return record.value, nil
 }
 
-func (db *DB) Delete(key string) error {
+func (db *DB) Delete(key string) (bool, error) {
 	record := newRecord(uint32(time.Now().Unix()), key, []byte{})
 	arr := record.encode()
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	activeFile := db.files[db.activeFileID]
-	_, _, err := activeFile.write(arr)
+	_, err := db.memstore.read(key)
 	if err != nil {
-		return err
+		return false, err
+	}
+	activeFile := db.files[db.activeFileID]
+	_, _, err = activeFile.write(arr)
+	if err != nil {
+		return false, err
 	}
 	db.memstore.delete(key)
 	err = db.rotate()
 	if err != nil {
 		fmt.Printf("error in file rotation: %s\n", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (db *DB) rotate() (err error) {
@@ -150,10 +155,10 @@ func (db *DB) rotate() (err error) {
 		if err == nil {
 			return
 		}
-		newFile.close()
+		closeHelper(newFile)
 		removeFile(newFilePath)
 		if roFile != nil {
-			roFile.close()
+			closeHelper(roFile)
 		}
 	}()
 	roFile, err = openDataFile(activeFile.path, activeFile.id)
@@ -163,7 +168,7 @@ func (db *DB) rotate() (err error) {
 	db.files[newFileId] = newFile
 	db.activeFileID = newFileId
 	db.files[activeFile.id] = roFile
-	activeFile.close()
+	closeHelper(activeFile)
 	return
 }
 
@@ -224,7 +229,7 @@ func (db *DB) merge() error {
 		return err
 	}
 	defer func() {
-		tempFile.close()
+		closeHelper(tempFile)
 		removeFile(tempFilePath)
 	}()
 	op := func(rec *record, offset int64, size uint32, id int) error {
@@ -278,7 +283,7 @@ func (db *DB) merge() error {
 		}
 		f := db.files[id]
 		delete(db.files, id)
-		f.close()
+		closeHelper(f)
 		removeFile(f.path)
 	}
 	return nil
@@ -314,4 +319,34 @@ func (db *DB) rebuild(fileIDs []int) error {
 		}
 	}
 	return nil
+}
+
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var errs error
+	for id, file := range db.files {
+		if id == db.activeFileID {
+			if err := file.sync(); err != nil {
+				errs = errors.Join(errs, err)
+			}
+		}
+
+		if err := closeHelper(file); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+	return errs
+}
+
+func closeHelper(file *datafile) error {
+	err := file.close()
+	if err != nil {
+		if errors.Is(err, ErrNilError) {
+			log.Printf("error in closing file:%s", err)
+		} else {
+			log.Printf("error in closing file: %s %s", file.path, err)
+		}
+	}
+	return err
 }

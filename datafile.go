@@ -99,11 +99,19 @@ func listFileIDs(path string, ext string) ([]int, error) {
 	return files, nil
 }
 
-func (f *datafile) close() {
+func (f *datafile) close() error {
 	if f == nil {
-		return
+		return ErrNilError
 	}
-	f.file.Close()
+	return f.file.Close()
+}
+
+func (f *datafile) sync() error {
+	if f == nil {
+		return nil
+	}
+	err := f.file.Sync()
+	return err
 }
 
 func removeFile(path string) {
