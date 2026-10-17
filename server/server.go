@@ -64,7 +64,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				writer.Write(formatError(err))
 				return
 			}
-			log.Println("closing conenction ", clientAddr)
+			log.Println("closing connection", clientAddr)
 			return
 		}
 		data, err := s.dispatch(args)

@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"io"
+	"log"
 	"os"
 	"slices"
 	"strconv"
@@ -103,7 +104,15 @@ func (f *datafile) close() error {
 	if f == nil {
 		return ErrNilError
 	}
-	return f.file.Close()
+	if f.file == nil {
+		return nil
+	}
+	err := f.file.Close()
+	f.file = nil
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (f *datafile) sync() error {
@@ -118,10 +127,20 @@ func removeFile(path string) {
 	os.Remove(path)
 }
 
-func move(from, to *datafile) error {
-	fromPath := from.path
-	toPath := to.path
-	from.close()
-	to.close()
-	return os.Rename(fromPath, toPath)
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			log.Printf("error while closing dir %s\n", err)
+		}
+	}()
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if err != nil {
+		return err
+	}
+	return nil
 }

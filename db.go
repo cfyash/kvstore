@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"sync"
 	"time"
+)
+
+const (
+	mergeInterval  = 600 * time.Second
+	mergeThreshold = 3
 )
 
 type DB struct {
@@ -19,6 +25,41 @@ type DB struct {
 	files        map[int]*datafile
 	mu           sync.RWMutex
 	mergeMu      sync.Mutex
+	mergeWorker  *worker
+}
+
+type worker struct {
+	name string
+	wg   sync.WaitGroup
+	done chan struct{}
+}
+
+func newWorker(name string) *worker {
+	return &worker{
+		name: name,
+		done: make(chan struct{}),
+	}
+}
+
+func (w *worker) loop(f func() error) {
+	t := time.NewTicker(mergeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			err := f()
+			if err != nil {
+				log.Printf("error while running %s: %s\n", w.name, err)
+			}
+		case <-w.done:
+			return
+		}
+	}
+}
+
+func (w *worker) stop() {
+	close(w.done)
+	w.wg.Wait()
 }
 
 const extension string = ".dat"
@@ -41,6 +82,9 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.mergeWorker.wg.Go(func() {
+		db.mergeWorker.loop(db.merge)
+	})
 	return db, nil
 }
 
@@ -71,6 +115,7 @@ func newDB(path string, fileIDs []int) (*DB, error) {
 		activeFileID: activeFileID,
 		path:         path,
 		files:        files,
+		mergeWorker:  newWorker("mergeWorker"),
 	}, nil
 }
 
@@ -217,7 +262,7 @@ func (db *DB) merge() error {
 		toBeMerged = append(toBeMerged, fileID)
 	}
 	db.mu.RUnlock()
-	if len(toBeMerged) == 0 {
+	if len(toBeMerged) < mergeThreshold {
 		return nil
 	}
 	slices.Sort(toBeMerged)
@@ -228,9 +273,14 @@ func (db *DB) merge() error {
 	if err != nil {
 		return err
 	}
+	swapped := false
+	var roTempFile *datafile
 	defer func() {
 		closeHelper(tempFile)
 		removeFile(tempFilePath)
+		if !swapped {
+			roTempFile.close()
+		}
 	}()
 	op := func(rec *record, offset int64, size uint32, id int) error {
 		db.mu.RLock()
@@ -265,18 +315,33 @@ func (db *DB) merge() error {
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	destFile := db.files[mergeFileId]
-	destPath := destFile.path
-	err = move(tempFile, destFile)
+	oldFile := db.files[mergeFileId]
+	destPath := oldFile.path
+	err = tempFile.sync()
 	if err != nil {
 		return err
 	}
-	roTempFile, err := openDataFile(destPath, mergeFileId)
+	err = tempFile.close()
 	if err != nil {
 		return err
 	}
+	roTempFile, err = openDataFile(tempFilePath, mergeFileId)
+	if err != nil {
+		return err
+	}
+	err = os.Rename(tempFilePath, destPath)
+	if err != nil {
+		return err
+	}
+	roTempFile.path = destPath
 	db.files[mergeFileId] = roTempFile
+	swapped = true
 	db.memstore.copyMergeKeyDir(tempKeyDir)
+	closeHelper(oldFile)
+	err = syncDir(db.path)
+	if err != nil {
+		return err
+	}
 	for _, id := range toBeMerged {
 		if id == mergeFileId {
 			continue
@@ -322,6 +387,7 @@ func (db *DB) rebuild(fileIDs []int) error {
 }
 
 func (db *DB) Close() error {
+	db.mergeWorker.stop()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var errs error
