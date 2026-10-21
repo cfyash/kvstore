@@ -219,6 +219,11 @@ func (db *DB) rotate() (err error) {
 
 func (db *DB) scanFile(file *datafile, op func(rec *record, offset int64, size uint32, id int) error) (int64, error) {
 	offset := int64(0)
+	fileInfo, err := file.file.Stat()
+	if err != nil {
+		return offset, err
+	}
+	fileLength := fileInfo.Size()
 	for {
 		h, err := file.read(offset, 16)
 		if errors.Is(err, io.EOF) {
@@ -228,6 +233,9 @@ func (db *DB) scanFile(file *datafile, op func(rec *record, offset int64, size u
 			return offset, err
 		}
 		chksum, timestamp, keySize, valueSize := decodeHeader(h)
+		if offset+16+int64(keySize)+int64(valueSize) <= fileLength {
+			return offset, io.ErrUnexpectedEOF
+		}
 		b, err := file.read(offset+16, keySize+valueSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
