@@ -233,7 +233,7 @@ func (db *DB) scanFile(file *datafile, op func(rec *record, offset int64, size u
 			return offset, err
 		}
 		chksum, timestamp, keySize, valueSize := decodeHeader(h)
-		if offset+16+int64(keySize)+int64(valueSize) <= fileLength {
+		if offset+16+int64(keySize)+int64(valueSize) > fileLength {
 			return offset, io.ErrUnexpectedEOF
 		}
 		b, err := file.read(offset+16, keySize+valueSize)
